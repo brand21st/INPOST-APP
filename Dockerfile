@@ -7,7 +7,7 @@ WORKDIR /app
 
 COPY package.json package-lock.json* ./
 
-RUN npm ci && npm cache clean --force
+RUN npm install --no-audit --no-fund && npm cache clean --force
 
 COPY . .
 
