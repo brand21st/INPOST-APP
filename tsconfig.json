@@ -1,5 +1,6 @@
 {
   "include": ["env.d.ts", "**/*.ts", "**/*.tsx", ".react-router/types/**/*"],
+  "exclude": ["**/*.test.ts"],
   "compilerOptions": {
     "lib": ["DOM", "DOM.Iterable", "ES2022"],
     "strict": true,
@@ -16,7 +17,7 @@
     "moduleResolution": "Bundler",
     "target": "ES2022",
     "baseUrl": ".",
-    "types": ["@react-router/node", "vite/client", "@shopify/polaris-types"],
+    "types": ["@react-router/node", "vite/client", "@shopify/polaris-types", "@shopify/app-bridge-types"],
     "rootDirs": [".", "./.react-router/types"]
   }
 }

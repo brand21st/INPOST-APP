@@ -1,0 +1,32 @@
+<div class="inpost-track" style="--inpost-accent: {{ block.settings.accent }};">
+  <h2>{{ block.settings.heading }}</h2>
+  <form class="inpost-track-form">
+    <label>
+      {{ 'track.consignment_label' | t }}
+      <input name="consignment" required maxlength="20" autocomplete="off">
+    </label>
+    <button type="submit">{{ 'track.submit' | t }}</button>
+  </form>
+  <div class="inpost-track-timeline" hidden></div>
+</div>
+<script src="{{ 'track.js' | asset_url }}" defer></script>
+{% schema %}
+{
+  "name": "t:name",
+  "target": "section",
+  "settings": [
+    {
+      "type": "text",
+      "id": "heading",
+      "label": "t:settings.heading",
+      "default": "Track your shipment"
+    },
+    {
+      "type": "color",
+      "id": "accent",
+      "label": "t:settings.accent",
+      "default": "#111111"
+    }
+  ]
+}
+{% endschema %}
