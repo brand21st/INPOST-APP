@@ -18,7 +18,7 @@ import { getSupabase } from "../db.server";
 import { requireInstalledShop } from "../../domain/tenancy/request.server";
 import { queueShipmentBooking } from "../../domain/shipping/list.server";
 import { formatCreated, formatMoney, serviceMark } from "../../domain/orders/page";
-import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/tracking.server";
+import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/trackable";
 import { drainShopShipping } from "../../workers/processor.server";
 import type { AdminGraphql } from "../../shopify/admin-graphql";
 

@@ -31,7 +31,7 @@ import { enqueueJob } from "../../domain/tenancy/shops.server";
 import { getOrderSyncState, listOrders, setOrderService, setShopService, shopServiceChoice, type ListedOrder } from "../../domain/orders/list.server";
 import { createShipment } from "../../domain/shipping/orders.server";
 import { formatCreated, formatMoney, orderQueryFromParams, paymentLabel, type OrderListQuery } from "../../domain/orders/page";
-import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/tracking.server";
+import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/trackable";
 import { logError } from "../../lib/logger.server";
 import { drainShopOrderSync, drainShopShipping } from "../../workers/processor.server";
 import type { AdminGraphql } from "../../shopify/admin-graphql";

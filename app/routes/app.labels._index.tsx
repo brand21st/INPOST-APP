@@ -25,7 +25,7 @@ import { requireInstalledShop } from "../../domain/tenancy/request.server";
 import { labelQueryFromParams, listLabels, type LabelListQuery, type ListedLabel } from "../../domain/labels/list.server";
 import { queueLabelGeneration } from "../../domain/labels/store.server";
 import { formatCreated } from "../../domain/orders/page";
-import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/tracking.server";
+import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/trackable";
 import { logError } from "../../lib/logger.server";
 import { drainShopShipping } from "../../workers/processor.server";
 import type { AdminGraphql } from "../../shopify/admin-graphql";
