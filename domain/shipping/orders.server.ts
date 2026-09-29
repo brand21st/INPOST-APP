@@ -5,6 +5,7 @@ import { mapShopifyPayment } from "./payment";
 export type OrderProjectionInput = {
   shopifyOrderGid: string;
   orderName: string | null;
+  shopifyCreatedAt: string | null;
   financialStatus: string | null;
   fulfillmentStatus: string | null;
   gatewayNames: string[];
@@ -21,6 +22,7 @@ export type OrderProjectionInput = {
     sku: string | null;
     quantity: number;
     grams: number | null;
+    unitPrice: number | null;
   }[];
 };
 
@@ -39,6 +41,7 @@ export function projectionFromRestOrder(payload: Record<string, unknown>): Order
   return {
     shopifyOrderGid: gid,
     orderName: typeof payload.name === "string" ? payload.name : null,
+    shopifyCreatedAt: typeof payload.created_at === "string" ? payload.created_at : null,
     financialStatus: typeof payload.financial_status === "string" ? payload.financial_status : null,
     fulfillmentStatus:
       typeof payload.fulfillment_status === "string" ? payload.fulfillment_status : null,
@@ -64,6 +67,7 @@ export function projectionFromRestOrder(payload: Record<string, unknown>): Order
         sku: typeof item.sku === "string" ? item.sku : null,
         quantity: Number(item.quantity ?? 1),
         grams: item.grams == null ? null : Number(item.grams),
+        unitPrice: item.price == null ? null : Number(item.price),
       };
     }),
   };
@@ -97,6 +101,7 @@ export async function upsertOrderProjection(shopId: string, input: OrderProjecti
         phone: input.phone,
         pincode: input.pincode,
         cancelled_at: input.cancelledAt,
+        shopify_created_at: input.shopifyCreatedAt,
         status,
       },
       { onConflict: "shop_id,shopify_order_gid" },
@@ -109,14 +114,13 @@ export async function upsertOrderProjection(shopId: string, input: OrderProjecti
   for (const line of input.lines) {
     const { data: existing } = await getSupabase()
       .from("order_line_items")
-      .select("id, grams")
+      .select("id, grams, unit_price")
       .eq("shop_id", shopId)
       .eq("shopify_line_item_gid", line.gid)
       .maybeSingle();
-    const grams =
-      existing && (existing as { grams: number | null }).grams != null
-        ? (existing as { grams: number | null }).grams
-        : line.grams;
+    const previous = existing as { grams: number | null; unit_price: number | null } | null;
+    const grams = previous?.grams != null ? previous.grams : line.grams;
+    const unitPrice = line.unitPrice != null ? line.unitPrice : (previous?.unit_price ?? null);
     const { error: lineError } = await getSupabase().from("order_line_items").upsert(
       {
         shop_id: shopId,
@@ -126,6 +130,7 @@ export async function upsertOrderProjection(shopId: string, input: OrderProjecti
         sku: line.sku,
         quantity: line.quantity,
         grams,
+        unit_price: unitPrice,
       },
       { onConflict: "shop_id,shopify_line_item_gid" },
     );

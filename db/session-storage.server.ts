@@ -57,7 +57,7 @@ function rowToSession(row: SessionRow): Session {
   return session;
 }
 
-function sessionToRow(session: Session): SessionRow {
+export function sessionToRow(session: Session): SessionRow {
   const user = session.onlineAccessInfo?.associated_user;
   return {
     id: session.id,

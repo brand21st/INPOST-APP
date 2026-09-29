@@ -1,0 +1,294 @@
+import { useEffect, useState } from "react";
+import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
+import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
+import { boundary } from "@shopify/shopify-app-react-router/server";
+import {
+  Badge,
+  BlockStack,
+  Button,
+  ButtonGroup,
+  Card,
+  Filters,
+  IndexTable,
+  InlineStack,
+  Link,
+  Page,
+  Select,
+  Text,
+  TextField,
+  Tooltip,
+  useIndexResourceState,
+} from "@shopify/polaris";
+import { PrintIcon } from "@shopify/polaris-icons";
+import { AdminEmptyState, AdminListFeedback, AdminPagination } from "../components/polaris/AdminList";
+import { requireInstalledShop } from "../../domain/tenancy/request.server";
+import { labelQueryFromParams, listLabels, type LabelListQuery, type ListedLabel } from "../../domain/labels/list.server";
+import { queueLabelGeneration } from "../../domain/labels/store.server";
+import { formatCreated } from "../../domain/orders/page";
+import { isTrackable, trackingUnavailableCopy } from "../../domain/shipping/tracking.server";
+import { logError } from "../../lib/logger.server";
+import { drainShopShipping } from "../../workers/processor.server";
+import type { AdminGraphql } from "../../shopify/admin-graphql";
+
+function href(filters: LabelListQuery, page = 1) {
+  const params = new URLSearchParams();
+  if (filters.search) params.set("q", filters.search);
+  if (filters.date && filters.date !== "all") params.set("date", filters.date);
+  if (filters.date === "custom" && filters.from) params.set("from", filters.from);
+  if (filters.date === "custom" && filters.to) params.set("to", filters.to);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.service) params.set("service", filters.service);
+  if (page > 1) params.set("page", String(page));
+  const search = params.toString();
+  return search ? `/app/labels?${search}` : "/app/labels";
+}
+
+function labelStatus(status: string) {
+  if (status === "PENDING") return "Generating";
+  if (status === "READY") return "Generated";
+  if (status === "FAILED") return "Failed";
+  return status;
+}
+
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { shop } = await requireInstalledShop(request);
+  const url = new URL(request.url);
+  const filters = labelQueryFromParams(url.searchParams);
+  const page = Number(url.searchParams.get("page") ?? "1");
+  try {
+    const result = await listLabels(shop.id, page, filters);
+    return { ...result, filters, error: null as string | null };
+  } catch (error) {
+    logError("labels list failed", {
+      shop_id: shop.id,
+      event: "labels_list",
+      result: "error",
+      error: error instanceof Error ? error.message.slice(0, 200) : "error",
+    });
+    return {
+      labels: [] as ListedLabel[],
+      count: 0,
+      page: 1,
+      hasPrevious: false,
+      hasNext: false,
+      timeZone: "UTC",
+      filters,
+      error: "Unable to load labels. Try again.",
+    };
+  }
+};
+
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { admin, shop } = await requireInstalledShop(request);
+  const form = await request.formData();
+  if (form.get("intent") === "reprint") {
+    try {
+      const queued = await queueLabelGeneration(shop.id, String(form.get("shipment_id") ?? ""));
+      if (queued) await drainShopShipping(shop.id, async () => admin as AdminGraphql);
+      return { ok: true as const, queued };
+    } catch (error) {
+      logError("label reprint failed", {
+        shop_id: shop.id,
+        event: "label_reprint",
+        result: "error",
+        error: error instanceof Error ? error.message.slice(0, 200) : "error",
+      });
+      return { ok: false as const, error: "Label could not be generated again." };
+    }
+  }
+  return { ok: false as const, error: "Action is not available." };
+};
+
+export default function LabelsIndex() {
+  const data = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const loading = navigation.state !== "idle";
+  const rows = data.labels as ListedLabel[];
+  const [query, setQuery] = useState(data.filters.search ?? "");
+  const [status, setStatus] = useState(data.filters.status ?? "");
+  const [service, setService] = useState(data.filters.service ?? "");
+  const [from, setFrom] = useState(data.filters.from ?? "");
+  const [to, setTo] = useState(data.filters.to ?? "");
+  const { selectedResources, allResourcesSelected, handleSelectionChange } = useIndexResourceState(rows);
+  const filtered = Boolean(data.filters.search) || data.filters.date !== "all" || Boolean(data.filters.status) || Boolean(data.filters.service);
+
+  useEffect(() => {
+    if (actionData?.ok) {
+      (window as unknown as { shopify?: { toast?: { show: (message: string) => void } } }).shopify?.toast?.show("Label generation queued.");
+    }
+  }, [actionData]);
+
+  const filters = [
+    {
+      key: "status",
+      label: "Label status",
+      filter: (
+        <Select
+          label="Label status"
+          labelHidden
+          options={[
+            { label: "All statuses", value: "" },
+            { label: "Generating", value: "PENDING" },
+            { label: "Generated", value: "READY" },
+            { label: "Failed", value: "FAILED" },
+          ]}
+          value={status}
+          onChange={setStatus}
+        />
+      ),
+      shortcut: true,
+    },
+    {
+      key: "service",
+      label: "Service",
+      filter: (
+        <Select
+          label="Service"
+          labelHidden
+          options={[
+            { label: "All services", value: "" },
+            { label: "Speed Post", value: "SP_INLAND_PARCEL" },
+            { label: "Business Parcel", value: "BUSINESS_PARCEL" },
+          ]}
+          value={service}
+          onChange={setService}
+        />
+      ),
+      shortcut: true,
+    },
+  ];
+  const appliedFilters = [
+    ...(status ? [{ key: "status", label: `Status: ${labelStatus(status)}`, onRemove: () => setStatus("") }] : []),
+    ...(service ? [{ key: "service", label: `Service: ${service === "SP_INLAND_PARCEL" ? "Speed Post" : "Business Parcel"}`, onRemove: () => setService("") }] : []),
+  ];
+
+  return (
+    <Page title="Labels" fullWidth>
+      <BlockStack gap="400">
+        <Text as="p" tone="subdued">Official India Post labels for this shop.</Text>
+        <AdminListFeedback loading={loading} error={data.error ?? (actionData && !actionData.ok ? actionData.error : null)} />
+        <Card>
+          <BlockStack gap="400">
+            <InlineStack align="space-between" blockAlign="center" gap="300">
+              <ButtonGroup>
+                <Button url={href({ ...data.filters, date: "all" })} pressed={data.filters.date === "all"}>All</Button>
+                <Button url={href({ ...data.filters, date: "today" })} pressed={data.filters.date === "today"}>Today</Button>
+                <Button url={href({ ...data.filters, date: "yesterday" })} pressed={data.filters.date === "yesterday"}>Yesterday</Button>
+                <Button url={href({ ...data.filters, date: "custom" })} pressed={data.filters.date === "custom"}>Custom date</Button>
+              </ButtonGroup>
+              <Tooltip content="Print agent is not connected">
+                <Button disabled icon={PrintIcon} accessibilityLabel="Print selected">
+                  Print selected
+                </Button>
+              </Tooltip>
+            </InlineStack>
+            <Text as="p" tone="subdued">Print agent is not connected.</Text>
+            <Form method="get">
+              <input type="hidden" name="q" value={query} />
+              <input type="hidden" name="date" value={data.filters.date ?? "all"} />
+              <input type="hidden" name="status" value={status} />
+              <input type="hidden" name="service" value={service} />
+              <BlockStack gap="300">
+                <Filters
+                  queryValue={query}
+                  queryPlaceholder="Search order, tracking, customer, label..."
+                  filters={filters}
+                  appliedFilters={appliedFilters}
+                  onQueryChange={setQuery}
+                  onQueryClear={() => setQuery("")}
+                  onClearAll={() => window.location.assign("/app/labels")}
+                />
+                {data.filters.date === "custom" ? (
+                  <InlineStack gap="300" wrap>
+                    <TextField label="From" type="date" value={from} onChange={setFrom} name="from" autoComplete="off" />
+                    <TextField label="To" type="date" value={to} onChange={setTo} name="to" autoComplete="off" />
+                  </InlineStack>
+                ) : null}
+                <InlineStack align="end"><Button submit variant="primary">Apply filters</Button></InlineStack>
+              </BlockStack>
+            </Form>
+          </BlockStack>
+        </Card>
+        {!data.error && !loading && rows.length === 0 ? (
+          <Card>
+            <AdminEmptyState
+              heading={filtered ? "No matching labels" : "No labels found"}
+              description={filtered ? "Try changing or clearing your filters." : "Generated India Post labels will appear here."}
+            />
+          </Card>
+        ) : null}
+        {rows.length > 0 ? (
+          <Card padding="0">
+            <IndexTable
+              resourceName={{ singular: "label", plural: "labels" }}
+              itemCount={rows.length}
+              selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
+              onSelectionChange={handleSelectionChange}
+              loading={loading}
+              headings={[
+                { title: "Label" },
+                { title: "Order" },
+                { title: "Customer" },
+                { title: "Service" },
+                { title: "Tracking ID" },
+                { title: "Status" },
+                { title: "Created" },
+                { title: "Actions" },
+              ]}
+            >
+              {rows.map((row, index) => {
+                const created = formatCreated(row.createdAt, data.timeZone);
+                const canReprint = row.status === "FAILED" || row.status === "PENDING";
+                return (
+                  <IndexTable.Row id={row.id} key={row.id} position={index} selected={selectedResources.includes(row.id)}>
+                    <IndexTable.Cell><Text as="span" fontWeight="semibold">{row.id.slice(0, 8)}</Text></IndexTable.Cell>
+                    <IndexTable.Cell><Link url={`/app/orders/${row.orderId}`} dataPrimaryLink>{row.orderName}</Link></IndexTable.Cell>
+                    <IndexTable.Cell>{row.customer}</IndexTable.Cell>
+                    <IndexTable.Cell>{row.service ?? "—"}</IndexTable.Cell>
+                    <IndexTable.Cell>{row.trackingNumber ?? "—"}</IndexTable.Cell>
+                    <IndexTable.Cell><Badge tone={row.status === "FAILED" ? "critical" : row.status === "READY" ? "success" : "info"}>{labelStatus(row.status)}</Badge></IndexTable.Cell>
+                    <IndexTable.Cell>{created.date} {created.time}</IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <InlineStack gap="200" blockAlign="center" wrap>
+                        {isTrackable(row.trackingNumber, row.status) ? (
+                          <Button url={`/app/tracking?q=${encodeURIComponent(row.trackingNumber ?? "")}`} variant="plain">Track</Button>
+                        ) : <Text as="span" tone="subdued">{trackingUnavailableCopy(row.trackingNumber)}</Text>}
+                        {row.status === "READY" ? (
+                          <>
+                            <Button url={`/app/labels/${row.id}?view=1`} target="_blank" variant="plain">View</Button>
+                            <Button url={`/app/labels/${row.id}`} variant="plain">Download</Button>
+                          </>
+                        ) : null}
+                        <Tooltip content="Print agent is not connected">
+                          <Button disabled variant="plain" icon={PrintIcon} accessibilityLabel="Print label">
+                            Print
+                          </Button>
+                        </Tooltip>
+                        {canReprint ? (
+                          <Form method="post">
+                            <input type="hidden" name="intent" value="reprint" />
+                            <input type="hidden" name="shipment_id" value={row.shipmentId} />
+                            <Button submit variant="plain">Reprint</Button>
+                          </Form>
+                        ) : <Button disabled variant="plain">Reprint</Button>}
+                      </InlineStack>
+                    </IndexTable.Cell>
+                  </IndexTable.Row>
+                );
+              })}
+            </IndexTable>
+          </Card>
+        ) : null}
+        <InlineStack align="center">
+          <AdminPagination
+            previousUrl={data.hasPrevious ? href(data.filters, data.page - 1) : undefined}
+            nextUrl={data.hasNext ? href(data.filters, data.page + 1) : undefined}
+          />
+        </InlineStack>
+      </BlockStack>
+    </Page>
+  );
+}
+
+export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);

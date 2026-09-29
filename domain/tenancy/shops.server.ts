@@ -1,7 +1,6 @@
 import type { Session } from "@shopify/shopify-api";
 import type { AdminGraphql } from "../../shopify/admin-graphql";
 import { getSupabase, requireShopId } from "../../app/db.server";
-import { encryptOptional } from "../../lib/crypto.server";
 import { logInfo } from "../../lib/logger.server";
 
 export type ShopRow = {
@@ -9,7 +8,38 @@ export type ShopRow = {
   shop_domain: string;
   status: string;
   encrypted_offline_token: string | null;
+  installed_at: string | null;
 };
+
+export function installRecord(
+  existing: Pick<ShopRow, "status" | "installed_at"> | null,
+  now: string,
+) {
+  const fresh = !existing || existing.status === "UNINSTALLED";
+  return {
+    event: !existing ? "install" : existing.status === "UNINSTALLED" ? "reinstall" : "reauth",
+    installed_at: existing?.installed_at ?? now,
+    shouldSyncOrders: fresh,
+    status: "INSTALLED" as const,
+  };
+}
+
+export function assertInstalledShop(shop: ShopRow | null): ShopRow {
+  if (!shop || shop.status !== "INSTALLED") {
+    logInfo("authentication denied", {
+      shop: shop?.shop_domain ?? null,
+      event: "auth_denied",
+      result: "denied",
+    });
+    throw new Response("Shop is not installed", { status: 401 });
+  }
+  return shop;
+}
+
+export function shopDomainFromSession(sessionShop: string, clientSuppliedShop?: string | null): string {
+  void clientSuppliedShop;
+  return normalizeShopDomain(sessionShop);
+}
 
 const SHOP_QUERY = `#graphql
   query InpostShopIdentity {
@@ -32,7 +62,7 @@ export async function getShopByDomain(shop: string): Promise<ShopRow | null> {
   const domain = normalizeShopDomain(shop);
   const { data, error } = await getSupabase()
     .from("shops")
-    .select("id, shop_domain, status, encrypted_offline_token")
+    .select("id, shop_domain, status, encrypted_offline_token, installed_at")
     .eq("shop_domain", domain)
     .maybeSingle();
   if (error) throw new Error(error.message);
@@ -56,6 +86,8 @@ export async function upsertShopOnInstall(session: Session, admin: AdminGraphql)
   };
   const shop = body.data?.shop;
   const now = new Date().toISOString();
+  const existing = await getShopByDomain(domain);
+  const transition = installRecord(existing, now);
   const row = {
     shop_domain: domain,
     shop_gid: shop?.id ?? null,
@@ -63,14 +95,14 @@ export async function upsertShopOnInstall(session: Session, admin: AdminGraphql)
     email: shop?.email ?? null,
     currency: shop?.currencyCode ?? null,
     timezone: shop?.ianaTimezone ?? null,
-    encrypted_offline_token: session.accessToken ? encryptOptional(session.accessToken) : null,
-    token_expires_at: session.expires ? session.expires.toISOString() : null,
-    refresh_token: encryptOptional(session.refreshToken),
+    encrypted_offline_token: null,
+    token_expires_at: null,
+    refresh_token: null,
     scopes: session.scope ?? null,
-    status: "INSTALLED",
-    installed_at: now,
+    status: transition.status,
+    installed_at: transition.installed_at,
     uninstalled_at: null,
-    webhooks_registered_at: now,
+    ...(transition.shouldSyncOrders ? { webhooks_registered_at: now } : {}),
   };
   const { data, error } = await getSupabase()
     .from("shops")
@@ -86,13 +118,27 @@ export async function upsertShopOnInstall(session: Session, admin: AdminGraphql)
   if (settingsError) throw new Error(settingsError.message);
   await getSupabase().from("audit_logs").insert({
     shop_id: shopId,
-    action: "install",
+    action: transition.event,
     entity_type: "shop",
     entity_id: shopId,
   });
-  await enqueueJob(shopId, "order-sync", null, {});
-  logInfo("shop installed", { shop_id: shopId, shop: domain });
+  if (transition.shouldSyncOrders) {
+    await enqueueJob(shopId, "order-sync", null, {});
+  }
+  logInfo("shop authenticated", {
+    shop_id: shopId,
+    shop: domain,
+    event: transition.event,
+    result: "ok",
+  });
   return shopId;
+}
+
+export async function updateShopScopes(shop: string, scopes: string) {
+  const domain = normalizeShopDomain(shop);
+  const { error } = await getSupabase().from("shops").update({ scopes }).eq("shop_domain", domain);
+  if (error) throw new Error(error.message);
+  logInfo("shop scopes updated", { shop: domain, event: "scopes_update", result: "ok" });
 }
 
 export async function markShopUninstalled(shop: string) {
@@ -123,7 +169,12 @@ export async function markShopUninstalled(shop: string) {
     });
   }
   await getSupabase().from("shopify_sessions").delete().eq("shop", domain);
-  logInfo("shop uninstalled", { shop: domain, shop_id: existing?.id ?? null });
+  logInfo("shop uninstalled", {
+    shop: domain,
+    shop_id: existing?.id ?? null,
+    event: "uninstall",
+    result: "ok",
+  });
 }
 
 export async function enqueueJob(

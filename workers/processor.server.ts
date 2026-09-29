@@ -3,10 +3,13 @@ import { bookShipment } from "../domain/shipping/booking.server";
 import { generateOfficialLabel } from "../domain/labels/store.server";
 import { projectionFromRestOrder, upsertOrderProjection, maybeAutoBook } from "../domain/shipping/orders.server";
 import { applyTrackingEvent } from "../domain/shipping/tracking.server";
+import { enqueueJob } from "../domain/tenancy/shops.server";
+import { projectionFromGraphqlOrder } from "../domain/orders/graphql-order";
+import { cursorIfPageAccepted, isShopifyThrottled, ShopifyThrottleError } from "../domain/orders/page";
 import { isPermanent, retryDelaySeconds } from "../domain/india-post/errors";
 import { CeptError } from "../domain/india-post/client.server";
 import { writeShopifyFulfillment } from "../shopify/fulfillments.server";
-import { UNFULFILLED_ORDERS } from "../shopify/graphql";
+import { ORDERS_PAGE } from "../shopify/graphql";
 import { logError, logInfo } from "../lib/logger.server";
 import type { AdminGraphql } from "../shopify/admin-graphql";
 
@@ -35,6 +38,19 @@ async function finishJob(job: JobRow, error?: unknown) {
       .from("background_jobs")
       .update({ status: "DEAD", last_error: message.slice(0, 500), locked_until: null })
       .eq("id", job.id);
+    if (job.type === "order-sync") {
+      const finished = new Date().toISOString();
+      await getSupabase().from("order_sync_states").upsert(
+        {
+          shop_id: job.shop_id,
+          status: "FAILED",
+          last_error: message.slice(0, 500),
+          finished_at: finished,
+          updated_at: finished,
+        },
+        { onConflict: "shop_id" },
+      );
+    }
     return;
   }
   const runAfter = new Date(Date.now() + delay * 1000).toISOString();
@@ -54,7 +70,24 @@ async function shopIsInstalled(shopId: string): Promise<boolean> {
   return (data as { status: string } | null)?.status === "INSTALLED";
 }
 
-async function processOrderSync(job: JobRow, adminForShop: (shop: string) => Promise<AdminGraphql>) {
+async function processOrderSync(
+  job: JobRow,
+  adminForShop: (shop: string) => Promise<AdminGraphql>,
+): Promise<string | null> {
+  const cursor = typeof job.payload.cursor === "string" ? job.payload.cursor : null;
+  const now = new Date().toISOString();
+  await getSupabase()
+    .from("order_sync_states")
+    .upsert(
+      {
+        shop_id: job.shop_id,
+        status: "RUNNING",
+        last_error: null,
+        updated_at: now,
+        ...(cursor ? {} : { started_at: now, finished_at: null, processed_count: 0, cursor: null }),
+      },
+      { onConflict: "shop_id" },
+    );
   const { data: shop } = await getSupabase()
     .from("shops")
     .select("shop_domain")
@@ -62,60 +95,44 @@ async function processOrderSync(job: JobRow, adminForShop: (shop: string) => Pro
     .single();
   const domain = (shop as { shop_domain: string }).shop_domain;
   const admin = await adminForShop(domain);
-  const since = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const cursor = typeof job.payload.cursor === "string" ? job.payload.cursor : null;
-  const response = await admin.graphql(UNFULFILLED_ORDERS, {
-    variables: {
-      cursor,
-      query: `fulfillment_status:unfulfilled created_at:>=${since}`,
-    },
-  });
-  const body = (await response.json()) as {
-    data?: {
-      orders?: {
-        pageInfo: { hasNextPage: boolean; endCursor: string | null };
-        nodes: Array<Record<string, unknown>>;
-      };
-    };
-  };
+  const response = await admin.graphql(ORDERS_PAGE, { variables: { cursor } });
+  const body = (await response.json()) as Parameters<typeof isShopifyThrottled>[0];
+  if (isShopifyThrottled(body)) throw new ShopifyThrottleError();
   const connection = body.data?.orders;
-  for (const node of connection?.nodes ?? []) {
-    const address = (node.shippingAddress ?? {}) as Record<string, unknown>;
-    const total = (node.currentTotalPriceSet as { shopMoney?: { amount?: string } } | null)?.shopMoney?.amount;
-    const outstanding = (node.totalOutstandingSet as { shopMoney?: { amount?: string } } | null)?.shopMoney?.amount;
-    const lines = ((node.lineItems as { nodes?: Record<string, unknown>[] } | null)?.nodes ?? []).map((line) => ({
-      gid: String(line.id),
-      title: typeof line.title === "string" ? line.title : null,
-      sku: typeof line.sku === "string" ? line.sku : null,
-      quantity: Number(line.quantity ?? 1),
-      grams: null,
-    }));
-    const orderId = await upsertOrderProjection(job.shop_id, {
-      shopifyOrderGid: String(node.id),
-      orderName: typeof node.name === "string" ? node.name : null,
-      financialStatus: typeof node.displayFinancialStatus === "string" ? node.displayFinancialStatus : null,
-      fulfillmentStatus:
-        typeof node.displayFulfillmentStatus === "string" ? node.displayFulfillmentStatus : null,
-      gatewayNames: Array.isArray(node.paymentGatewayNames)
-        ? node.paymentGatewayNames.filter((name): name is string => typeof name === "string")
-        : [],
-      orderTotal: Number(total ?? 0),
-      amountOutstanding: Number(outstanding ?? 0),
-      shippingName: typeof address.name === "string" ? address.name : null,
-      shippingAddress: [address.address1, address.address2, address.city, address.zip]
-        .filter((part) => typeof part === "string")
-        .join(", "),
-      phone: typeof address.phone === "string" ? address.phone : null,
-      pincode: typeof address.zip === "string" ? address.zip : null,
-      cancelledAt: typeof node.cancelledAt === "string" ? node.cancelledAt : null,
-      lines,
-    });
-    await maybeAutoBook(job.shop_id, orderId);
+  if (!connection) throw new Error("Shopify orders query failed");
+  const nodes = (connection as { nodes?: Array<Record<string, unknown>> }).nodes ?? [];
+  for (const node of nodes) {
+    await upsertOrderProjection(job.shop_id, projectionFromGraphqlOrder(node));
   }
-  if (connection?.pageInfo.hasNextPage && connection.pageInfo.endCursor) {
-    const { enqueueJob } = await import("../domain/tenancy/shops.server");
-    await enqueueJob(job.shop_id, "order-sync", null, { cursor: connection.pageInfo.endCursor });
+  const { data: state } = await getSupabase()
+    .from("order_sync_states")
+    .select("processed_count")
+    .eq("shop_id", job.shop_id)
+    .maybeSingle();
+  const processed = Number((state as { processed_count?: number } | null)?.processed_count ?? 0) + nodes.length;
+  const next = cursorIfPageAccepted(body);
+  const updated = new Date().toISOString();
+  if (next) {
+    await getSupabase()
+      .from("order_sync_states")
+      .update({ status: "RUNNING", cursor: next, processed_count: processed, updated_at: updated })
+      .eq("shop_id", job.shop_id);
+    logInfo("order sync page", { shop_id: job.shop_id, event: "sync_page", processed: nodes.length, result: "ok" });
+    return next;
   }
+  await getSupabase()
+    .from("order_sync_states")
+    .update({
+      status: "COMPLETED",
+      cursor: null,
+      processed_count: processed,
+      finished_at: updated,
+      updated_at: updated,
+      last_error: null,
+    })
+    .eq("shop_id", job.shop_id);
+  logInfo("order sync completed", { shop_id: job.shop_id, event: "sync_completed", processed, result: "ok" });
+  return null;
 }
 
 async function processFulfillment(job: JobRow, adminForShop: (shop: string) => Promise<AdminGraphql>) {
@@ -194,6 +211,7 @@ export async function processJob(job: JobRow, adminForShop: (shop: string) => Pr
     await getSupabase().from("background_jobs").update({ status: "CANCELLED" }).eq("id", job.id);
     return;
   }
+  let nextCursor: string | null = null;
   try {
     if (job.type === "shipment-booking" && job.entity_id) {
       await bookShipment(job.shop_id, job.entity_id);
@@ -202,13 +220,16 @@ export async function processJob(job: JobRow, adminForShop: (shop: string) => Pr
     } else if (job.type === "shopify-fulfillment" && job.entity_id) {
       await processFulfillment(job, adminForShop);
     } else if (job.type === "order-sync") {
-      await processOrderSync(job, adminForShop);
+      nextCursor = await processOrderSync(job, adminForShop);
     } else if (job.type === "webhook-process" || job.type === "india-post-events") {
       await processInbox(job);
     } else if (job.type === "compliance-process") {
       await processCompliance(job);
     }
     await finishJob(job);
+    if (nextCursor) {
+      await enqueueJob(job.shop_id, "order-sync", null, { cursor: nextCursor });
+    }
     logInfo("job succeeded", { job_id: job.id, shop_id: job.shop_id, type: job.type });
   } catch (error) {
     logError("job failed", {
@@ -243,6 +264,92 @@ async function processCompliance(job: JobRow) {
         .eq("shopify_order_gid", gid);
     }
   }
+}
+
+export async function drainShopOrderSync(
+  shopId: string,
+  adminForShop: (shop: string) => Promise<AdminGraphql>,
+  maxPages = 8,
+) {
+  const now = new Date().toISOString();
+  await getSupabase()
+    .from("background_jobs")
+    .update({ status: "QUEUED", locked_until: null })
+    .eq("shop_id", shopId)
+    .eq("type", "order-sync")
+    .eq("status", "RUNNING")
+    .lt("locked_until", now);
+
+  const deadline = Date.now() + 15000;
+  let processed = 0;
+  while (processed < maxPages && Date.now() < deadline) {
+    const { data } = await getSupabase()
+      .from("background_jobs")
+      .select("id, shop_id, type, entity_id, payload, attempts")
+      .eq("shop_id", shopId)
+      .eq("type", "order-sync")
+      .eq("status", "QUEUED")
+      .lte("run_after", new Date().toISOString())
+      .order("run_after", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (!data) break;
+    const row = data as JobRow;
+    const { data: claimed } = await getSupabase()
+      .from("background_jobs")
+      .update({
+        status: "RUNNING",
+        attempts: Number(row.attempts ?? 0) + 1,
+        locked_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      })
+      .eq("id", row.id)
+      .eq("status", "QUEUED")
+      .select("id, shop_id, type, entity_id, payload, attempts")
+      .maybeSingle();
+    if (!claimed) break;
+    await processJob(claimed as JobRow, adminForShop);
+    processed += 1;
+  }
+  return processed;
+}
+
+export async function drainShopShipping(
+  shopId: string,
+  adminForShop: (shop: string) => Promise<AdminGraphql>,
+  maxJobs = 8,
+) {
+  const types = ["shipment-booking", "label-generation", "shopify-fulfillment"];
+  const deadline = Date.now() + 20000;
+  let processed = 0;
+  while (processed < maxJobs && Date.now() < deadline) {
+    const { data } = await getSupabase()
+      .from("background_jobs")
+      .select("id, shop_id, type, entity_id, payload, attempts")
+      .eq("shop_id", shopId)
+      .in("type", types)
+      .eq("status", "QUEUED")
+      .lte("run_after", new Date().toISOString())
+      .order("run_after", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (!data) break;
+    const row = data as JobRow;
+    const { data: claimed } = await getSupabase()
+      .from("background_jobs")
+      .update({
+        status: "RUNNING",
+        attempts: Number(row.attempts ?? 0) + 1,
+        locked_until: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      })
+      .eq("id", row.id)
+      .eq("status", "QUEUED")
+      .select("id, shop_id, type, entity_id, payload, attempts")
+      .maybeSingle();
+    if (!claimed) break;
+    await processJob(claimed as JobRow, adminForShop);
+    processed += 1;
+  }
+  return processed;
 }
 
 export async function drainJobs(adminForShop: (shop: string) => Promise<AdminGraphql>, limit = 10) {

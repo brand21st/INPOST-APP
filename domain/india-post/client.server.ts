@@ -1,9 +1,12 @@
 import { decryptOptional, encryptSecret } from "../../lib/crypto.server";
 import { getSupabase } from "../../app/db.server";
+import { logInfo } from "../../lib/logger.server";
 import { classifyCeptFailure, type ErrorClass } from "./errors";
 
 const DEFAULT_UAT = "https://test.cept.gov.in/beextcustomer";
 const DEFAULT_PROD = "https://app.indiapost.gov.in/beextcustomer";
+const DEFAULT_UAT_MASTERDATA = "https://test.cept.gov.in/bemasterdata";
+const DEFAULT_PROD_MASTERDATA = "https://app.indiapost.gov.in/bemasterdata";
 
 export type ConnectionRow = {
   shop_id: string;
@@ -23,6 +26,89 @@ export function ceptRoot(environment: "UAT" | "PRODUCTION"): string {
       ? process.env.INDIA_POST_PROD_BASE_URL || DEFAULT_PROD
       : process.env.INDIA_POST_UAT_BASE_URL || DEFAULT_UAT;
   return raw.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+export function masterDataRoot(environment: "UAT" | "PRODUCTION"): string {
+  const raw =
+    environment === "PRODUCTION"
+      ? process.env.INDIA_POST_PROD_MASTERDATA_URL || DEFAULT_PROD_MASTERDATA
+      : process.env.INDIA_POST_UAT_MASTERDATA_URL || DEFAULT_UAT_MASTERDATA;
+  return raw.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+export type LoginTokenBody = {
+  success?: boolean;
+  access_token?: string;
+  accessToken?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  data?: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
+};
+
+export function readLoginTokens(body: LoginTokenBody): {
+  accessToken: string;
+  refreshToken: string | null;
+  expiresIn: number;
+} | null {
+  if (body.success === false) return null;
+  const accessToken = body.data?.access_token || body.access_token || body.accessToken || "";
+  if (!accessToken) return null;
+  const expiresIn = body.data?.expires_in ?? body.expires_in ?? 3600;
+  return {
+    accessToken,
+    refreshToken: body.data?.refresh_token || body.refresh_token || null,
+    expiresIn: expiresIn > 0 ? expiresIn : 3600,
+  };
+}
+
+export type DropOffice = {
+  pincode: string;
+  officeName: string;
+  officeId: string;
+  officeTypeCode: string;
+  stateName: string;
+  cityName: string;
+  deliveryOfficeFlag: boolean;
+  isRolledOut: boolean;
+};
+
+export function officeRows(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (typeof payload === "object" && payload !== null && Array.isArray((payload as { data?: unknown }).data)) {
+    return (payload as { data: unknown[] }).data;
+  }
+  return [];
+}
+
+function flagIsTrue(value: unknown): boolean {
+  return value === true || value === "true" || value === "TRUE" || value === 1 || value === "1";
+}
+
+export function eligibleDropOffices(payload: unknown): DropOffice[] {
+  const offices: DropOffice[] = [];
+  for (const row of officeRows(payload)) {
+    if (typeof row !== "object" || row === null) continue;
+    const office = row as Record<string, unknown>;
+    if (!flagIsTrue(office.delivery_office_flag)) continue;
+    if (String(office.office_type_code ?? "").toUpperCase() === "BPO") continue;
+    const officeId = String(office.office_id ?? "").trim();
+    if (!/^\d{8}$/.test(officeId)) continue;
+    offices.push({
+      pincode: String(office.pincode ?? ""),
+      officeName: String(office.office_name ?? ""),
+      officeId,
+      officeTypeCode: String(office.office_type_code ?? ""),
+      stateName: String(office.state_name ?? ""),
+      cityName: String(office.city_name ?? ""),
+      deliveryOfficeFlag: true,
+      isRolledOut: office.is_rolled_out === true,
+    });
+  }
+  return offices;
 }
 
 export class CeptError extends Error {
@@ -49,22 +135,77 @@ async function login(connection: ConnectionRow): Promise<string> {
     body: JSON.stringify({ username, password }),
   });
   const text = await response.text();
-  if (!response.ok) {
+  let body: LoginTokenBody = {};
+  try {
+    body = JSON.parse(text) as LoginTokenBody;
+  } catch {
+    body = {};
+  }
+  const tokens = response.ok ? readLoginTokens(body) : null;
+  if (!tokens) {
     throw new CeptError(classifyCeptFailure(response.status, text), "India Post login failed");
   }
-  const body = JSON.parse(text) as { access_token?: string; accessToken?: string; expires_in?: number };
-  const token = body.access_token ?? body.accessToken;
-  if (!token) throw new CeptError("PERMANENT_AUTH_ERROR", "India Post login returned no token");
-  const expiresAt = new Date(Date.now() + (body.expires_in ?? 3600) * 1000).toISOString();
-  await getSupabase()
-    .from("india_post_connections")
-    .update({
-      encrypted_access_token: encryptSecret(token),
-      token_expires_at: expiresAt,
-      status: "CONNECTED",
-    })
-    .eq("shop_id", connection.shop_id);
-  return token;
+  const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000).toISOString();
+  const patch: {
+    encrypted_access_token: string;
+    encrypted_refresh_token?: string;
+    token_expires_at: string;
+    status: string;
+    last_error: null;
+  } = {
+    encrypted_access_token: encryptSecret(tokens.accessToken),
+    token_expires_at: expiresAt,
+    status: "CONNECTED",
+    last_error: null,
+  };
+  if (tokens.refreshToken) patch.encrypted_refresh_token = encryptSecret(tokens.refreshToken);
+  await getSupabase().from("india_post_connections").update(patch).eq("shop_id", connection.shop_id);
+  return tokens.accessToken;
+}
+
+export async function connectWithCredentials(connection: ConnectionRow): Promise<void> {
+  await login({
+    ...connection,
+    encrypted_access_token: null,
+    token_expires_at: null,
+  });
+}
+
+export async function searchDropOffices(connection: ConnectionRow, pincode: string): Promise<DropOffice[]> {
+  if (!/^\d{6}$/.test(pincode)) {
+    throw new CeptError("VALIDATION_ERROR", "Pincode must be 6 digits");
+  }
+  const token = await login(connection);
+  const url = new URL(`${masterDataRoot(connection.environment)}/v1/offices/limited-details`);
+  url.searchParams.set("pincode", pincode);
+  url.searchParams.set("limit", "50");
+  url.searchParams.set("office-type", "post");
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const text = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
+  const shape = Array.isArray(payload)
+    ? `array:${payload.length}`
+    : payload && typeof payload === "object"
+      ? `object:${Object.keys(payload).slice(0, 8).join(",")}`
+      : "unreadable";
+  logInfo("drop office search response", {
+    shop_id: connection.shop_id,
+    event: "drop_office_search",
+    status: response.status,
+    shape,
+    result: response.ok ? "ok" : "error",
+  });
+  if (!response.ok || payload === null) {
+    throw new CeptError(classifyCeptFailure(response.status, text), "India Post office search failed");
+  }
+  return eligibleDropOffices(payload);
 }
 
 async function authorizedPost(connection: ConnectionRow, path: string, body: unknown) {

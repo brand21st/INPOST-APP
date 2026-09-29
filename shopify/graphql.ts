@@ -48,9 +48,9 @@ export const FULFILLMENT_TRACKING_UPDATE = `#graphql
   }
 `;
 
-export const UNFULFILLED_ORDERS = `#graphql
-  query InpostUnfulfilledOrders($cursor: String, $query: String!) {
-    orders(first: 50, after: $cursor, query: $query) {
+export const ORDERS_PAGE = `#graphql
+  query InpostOrdersPage($cursor: String) {
+    orders(first: 25, after: $cursor, sortKey: CREATED_AT) {
       pageInfo {
         hasNextPage
         endCursor
@@ -58,6 +58,7 @@ export const UNFULFILLED_ORDERS = `#graphql
       nodes {
         id
         name
+        createdAt
         displayFinancialStatus
         displayFulfillmentStatus
         paymentGatewayNames
@@ -86,6 +87,11 @@ export const UNFULFILLED_ORDERS = `#graphql
             title
             sku
             quantity
+            originalUnitPriceSet {
+              shopMoney {
+                amount
+              }
+            }
           }
         }
       }

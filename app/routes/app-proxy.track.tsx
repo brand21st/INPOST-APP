@@ -1,6 +1,6 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { getSupabase } from "../db.server";
-import { getShopByDomain } from "../../domain/tenancy/shops.server";
+import { assertInstalledShop, getShopByDomain } from "../../domain/tenancy/shops.server";
 import { publicTimeline } from "../../domain/shipping/tracking.server";
 import { authenticate } from "../shopify.server";
 
@@ -9,8 +9,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   if (!context.session) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  const shop = await getShopByDomain(context.session.shop);
-  if (!shop) return Response.json({ error: "not_found" }, { status: 404 });
+  const shop = assertInstalledShop(await getShopByDomain(context.session.shop));
 
   const consignment = new URL(request.url).searchParams.get("consignment") ?? "";
   const allowed = await getSupabase().rpc("consume_rate_limit", {
